@@ -50,11 +50,12 @@ from ast_nodes import (
     StringLiteral,
     TypeName,
     BinaryOperator,
+    UnaryExpr,
 )
 
 from selector import Selector
 
-from catalogue import rules
+from catalogue import rules, type_name
 
 from patterns import REG, COND, EFFECT, IMM12, POW2
 
@@ -62,12 +63,12 @@ class CodeGenerator:
     """Coordene comandos ad hoc e seleção de expressões com DP."""
 
     def generate(self, program):
-        """Traduza funções e comandos. Selecione expressões com DP[cite: 1, 3]."""
+        """Traduza funções e comandos. Selecione expressões com DP."""
 
         p = ProgramIR(list(), dict())
 
         for f in program.functions:
-            curr_f = FunctionIR(f, list())
+            curr_f = FunctionIR(f.metadata["symbol"], list())
             p.functions.append(curr_f)
 
             self.ctx = Context(curr_f, p)
@@ -89,7 +90,19 @@ class CodeGenerator:
         return p
 
     # função extra, para expression
-    def execute_action(self, action_name, node, sub_results, true_label, false_label):
+    def _literal_value(self, node):
+        # valor de literal com sinal: IntLiteral, BoolLiteral (0/1) ou -IntLiteral
+        if isinstance(node, UnaryExpr):
+            return -node.operand.value
+        return int(node.value)
+
+    def _split_reg_imm(self, sub_results):
+        # Addi/Slli aceitam o literal em qualquer lado: devolve (reg, imm)
+        if isinstance(sub_results[0], int):
+            return sub_results[1], sub_results[0]
+        return sub_results[0], sub_results[1]
+
+    def execute_action(self, action_name, node, sub_results, result_class, true_label, false_label):
         match action_name:
 
             # grupo: reg|label
@@ -107,41 +120,59 @@ class CodeGenerator:
                 dst = self.ctx.temp()
                 reg = sub_results[0]
                 self.ctx.emit(Move(dst, reg, origin=node.span))
+                return dst
 
             case "emit_neg":
                 dst = self.ctx.temp()
                 reg = sub_results[0]
                 self.ctx.emit(Neg(dst, reg, origin=node.span))
+                return dst
 
             case "emit_seqz":
                 dst = self.ctx.temp()
                 reg = sub_results[0]
                 self.ctx.emit(Seqz(dst, reg, origin=node.span))
+                return dst
                 
             case "emit_snez":
                 dst = self.ctx.temp()
                 reg = sub_results[0]
                 self.ctx.emit(Snez(dst, reg, origin=node.span))
+                return dst
 
 
             # grupo: dst, imm
             case "emit_literal_int":
                 dst = self.ctx.temp()
-                self.ctx.emit(Li(dst, node.value, origin=node.span))
+                self.ctx.emit(Li(dst, self._literal_value(node), origin=node.span))
                 return dst
+
+            # grupo: literal sem instrução (IMM12 oferece o valor, POW2 oferece o expoente k)
+            case "emit_pass":
+                value = self._literal_value(node)
+                if result_class == POW2:
+                    return value.bit_length() - 1
+                return value
 
 
             # grupo: dst, reg, imm
             case "emit_add_imm":
                 dst = self.ctx.temp()
+                lreg, imm = self._split_reg_imm(sub_results)
+                self.ctx.emit(Addi(dst, lreg, imm, origin=node.span))
+                return dst
+
+            case "emit_sub_neg_imm":
+                # x - c  =>  addi x, -c
+                dst = self.ctx.temp()
                 lreg = sub_results[0]
-                self.ctx.emit(Addi(dst, lreg, node.right.value, origin=node.span))
+                self.ctx.emit(Addi(dst, lreg, -self._literal_value(node.right), origin=node.span))
                 return dst
 
             case "emit_slli":
                 dst = self.ctx.temp()
-                lreg = sub_results[0]
-                self.ctx.emit(Slli(dst, lreg, node.right.value, origin=node.span))
+                lreg, shift = self._split_reg_imm(sub_results)
+                self.ctx.emit(Slli(dst, lreg, shift, origin=node.span))
                 return dst
 
             
@@ -187,6 +218,47 @@ class CodeGenerator:
                 rreg = sub_results[1]
                 self.ctx.emit(Slt(dst, lreg, rreg, origin=node.span))
                 return dst
+
+            case "emit_sgt":
+                # x > y <=> y < x
+                dst = self.ctx.temp()
+                lreg = sub_results[0]
+                rreg = sub_results[1]
+                self.ctx.emit(Slt(dst, rreg, lreg, origin=node.span))
+                return dst
+
+            case "emit_sle":
+                # x <= y <=> !(y < x)
+                tmp = self.ctx.temp()
+                dst = self.ctx.temp()
+                lreg = sub_results[0]
+                rreg = sub_results[1]
+                self.ctx.emit(Slt(tmp, rreg, lreg, origin=node.span))
+                self.ctx.emit(Seqz(dst, tmp, origin=node.span))
+                return dst
+
+            case "emit_sge":
+                # x >= y <=> !(x < y)
+                tmp = self.ctx.temp()
+                dst = self.ctx.temp()
+                lreg = sub_results[0]
+                rreg = sub_results[1]
+                self.ctx.emit(Slt(tmp, lreg, rreg, origin=node.span))
+                self.ctx.emit(Seqz(dst, tmp, origin=node.span))
+                return dst
+
+            case "emit_eq" | "emit_ne":
+                # x == y <=> (x ^ y) == 0
+                tmp = self.ctx.temp()
+                dst = self.ctx.temp()
+                lreg = sub_results[0]
+                rreg = sub_results[1]
+                self.ctx.emit(Xor(tmp, lreg, rreg, origin=node.span))
+                if action_name == "emit_eq":
+                    self.ctx.emit(Seqz(dst, tmp, origin=node.span))
+                else:
+                    self.ctx.emit(Snez(dst, tmp, origin=node.span))
+                return dst
             
             case "emit_xor":
                 dst = self.ctx.temp()
@@ -230,20 +302,50 @@ class CodeGenerator:
 
             # grupo: call
             case "emit_call":
-                args = sub_results
-                if result_class == "EFFECT":
+                args = list(sub_results)
+                if result_class == EFFECT:
                     dst = None
                 else:
                     dst = self.ctx.temp()
 
-                # pega de node.metadata["symbol"] ou de node.function
-                func_symbol = getattr(node, "symbol", getattr(node, "function", None))
+                # FunctionSymbol já resolvido pela semântica
+                func_symbol = node.metadata["symbol"]
                 self.ctx.emit(Call(dst, func_symbol, args, origin=node.span))
+                return dst
+
+            case "emit_call_cond":
+                # chamada bool como condição: call, bnez e j
+                dst = self.ctx.temp()
+                self.ctx.emit(Call(dst, node.metadata["symbol"], list(sub_results), origin=node.span))
+                self.ctx.emit(Bnez(dst, true_label, origin=node.span))
+                self.ctx.emit(Jump(false_label, origin=node.span))
+
+
+            # grupo: && e || como valor (REG), materializando 0/1
+            case "emit_logical_reg_and" | "emit_logical_reg_or":
+                dst = self.ctx.temp()
+                t_label = self.ctx.label()
+                f_label = self.ctx.label()
+                end_label = self.ctx.label()
+
+                # emite a condição com destinos próprios (mantém curto-circuito)
+                cond_action = "emit_cond_and" if action_name == "emit_logical_reg_and" else "emit_cond_or"
+                self.execute_action(cond_action, node, sub_results, COND, t_label, f_label)
+
+                self.ctx.emit(LabelInstr(t_label))
+                self.ctx.emit(Li(dst, 1, origin=node.span))
+                self.ctx.emit(Jump(end_label))
+                self.ctx.emit(LabelInstr(f_label))
+                self.ctx.emit(Li(dst, 0, origin=node.span))
+                self.ctx.emit(LabelInstr(end_label))
                 return dst
 
 
             # grupo: tratamento de condições (COND) com true_label e false_label
-            case "emit_cond_branch" | "emit_cond_comparison":
+            # os filhos COND chegam em sub_results como funções (true_label, false_label),
+            # emitidas só aqui, no caminho correto
+            case ("emit_cond_branch" | "emit_cond_comparison" | "emit_cond_and" | "emit_cond_or"
+                  | "emit_cond_not" | "emit_cond_literal" | "emit_cond_identifier"):
                 # Tratamento para BinaryExpr de comparação ou operadores lógicos
                 if type(node).__name__ == "BinaryExpr":
                     op = node.operator
@@ -251,15 +353,15 @@ class CodeGenerator:
                     # Operadores lógicos com curto-circuito (&& e ||)
                     if op == BinaryOperator.LOGICAL_AND:
                         mid_label = self.ctx.label()
-                        self.expression(node.left, "COND", true_label=mid_label, false_label=false_label)
+                        sub_results[0](mid_label, false_label)
                         self.ctx.emit(LabelInstr(mid_label))
-                        self.expression(node.right, "COND", true_label=true_label, false_label=false_label)
+                        sub_results[1](true_label, false_label)
                         return
                     elif op == BinaryOperator.LOGICAL_OR:
                         mid_label = self.ctx.label()
-                        self.expression(node.left, "COND", true_label=true_label, false_label=mid_label)
+                        sub_results[0](true_label, mid_label)
                         self.ctx.emit(LabelInstr(mid_label))
-                        self.expression(node.right, "COND", true_label=true_label, false_label=false_label)
+                        sub_results[1](true_label, false_label)
                         return
 
                     # Comparações relacionais que utilizam os registradores avaliados nos sub_results
@@ -288,7 +390,7 @@ class CodeGenerator:
                 elif type(node).__name__ == "UnaryExpr":
                     # Negação lógica (!) inverte os destinos verdadeiro e falso
                     if node.operator.value == "!":
-                        self.expression(node.operand, "COND", true_label=false_label, false_label=true_label)
+                        sub_results[0](false_label, true_label)
 
                 elif type(node).__name__ == "BoolLiteral":
                     if node.value:
@@ -297,7 +399,7 @@ class CodeGenerator:
                         self.ctx.emit(Jump(false_label, origin=node.span))
 
                 elif type(node).__name__ == "IdentifierExpr":
-                    reg = sub_results[0]
+                    reg = self.ctx.variable(node.metadata["symbol"])
                     self.ctx.emit(Bnez(reg, true_label, origin=node.span))
                     self.ctx.emit(Jump(false_label, origin=node.span))
 
@@ -305,10 +407,12 @@ class CodeGenerator:
             case _:
                 raise NotImplementedError(f"Ação não implementada no gerador: {action_name}")
             
-    def expression(self, node, result_class, true_label=None, false_label=None):
+    def expression(self, node, result_class, true_label=None, false_label=None, table=None):
         """Selecione e reconstrua uma expressão, preservando curto-circuito."""
         
-        table = Selector(rules).analyze(node)
+        # a análise é feita uma vez na raiz; os filhos reutilizam a mesma tabela
+        if table is None:
+            table = Selector(rules).analyze(node)
         choice = table.lookup(node, result_class)
 
         if choice is None:
@@ -319,10 +423,13 @@ class CodeGenerator:
         
         sub_results = []
         for sub_node, sub_class in choice.subproblems:
-            res = self.expression(sub_node, sub_class)
+            if sub_class == COND:
+                # COND não é emitida antes: a ação decide onde e com quais destinos
+                res = lambda t, f, n=sub_node: self.expression(n, COND, t, f, table)
+            else:
+                res = self.expression(sub_node, sub_class, table=table)
             sub_results.append(res)
 
-        # Repasse o result_class aqui para que a ação saiba se o contexto é REG, EFFECT, etc.
         return self.execute_action(rule.action, node, sub_results, result_class, true_label, false_label)
 
     def statement(self, node):
@@ -337,14 +444,14 @@ class CodeGenerator:
                 # se houver inicialização, ex.: int x = 2;
                 #                               li x, 2
                 if getattr(node, "initializer", None):
-                    val_reg = self.expression(node.initializer, "REG")
+                    val_reg = self.expression(node.initializer, REG)
                     dst = self.ctx.variable(node.metadata["symbol"])
-                    self.ctx.emit(Move(dst, val_reg, node.span))
+                    self.ctx.emit(Move(dst, val_reg, origin=node.span))
 
             case "Assignment":
                 # ex.: y = 3;
                 #      li y, 3
-                val_reg = self.expression(node.value, "REG")
+                val_reg = self.expression(node.value, REG)
                 dst = self.ctx.variable(node.target.metadata["symbol"])
                 self.ctx.emit(Move(dst, val_reg, origin=node.span))
 
@@ -372,7 +479,7 @@ class CodeGenerator:
                     end_label = false_label
 
 
-                self.expression(node.condition, "COND", true_label, false_label)
+                self.expression(node.condition, COND, true_label, false_label)
 
                 self.ctx.emit(LabelInstr(true_label))
                 self.statement(node.then_block)
@@ -401,7 +508,7 @@ class CodeGenerator:
                 end_label = self.ctx.label()
 
                 self.ctx.emit(LabelInstr(test_label))
-                self.expression(node.condition, "COND", true_label=body_label, false_label=end_label)
+                self.expression(node.condition, COND, true_label=body_label, false_label=end_label)
 
                 self.ctx.emit(LabelInstr(body_label))
                 self.statement(node.body)
@@ -414,7 +521,7 @@ class CodeGenerator:
                 # (li ., value)     # se houver valor
                 # ret
                 if getattr(node, "value", None):
-                    val_reg = self.expression(node.value, "REG")
+                    val_reg = self.expression(node.value, REG)
                     self.ctx.emit(Return(val_reg, origin=node.span))
                 else:
                     self.ctx.emit(Return(None, origin=node.span))
@@ -426,9 +533,9 @@ class CodeGenerator:
                         ref = self.ctx.string(item.value)
                         self.ctx.emit(PrintString(ref, origin=item.span))
                     else:
-                        val_reg = self.expression(item, "REG")
+                        val_reg = self.expression(item, REG)
 
-                        if getattr(item, "type", None) == TypeName.BOOL:
+                        if type_name(item) == "bool":
                             self.ctx.emit(PrintBool(val_reg, origin=item.span))
                         else:
                             self.ctx.emit(PrintInt(val_reg, origin=item.span))
@@ -438,11 +545,8 @@ class CodeGenerator:
                 self.ctx.emit(PrintString(newline_ref))
 
             case "CallStmt":
-                # chamada de função do tipo void usa EFFECT e não um registrador
-                if getattr(node.call.type, "name", "") == "void":
-                    self.expression(node.call, "EFFECT")
-                else:
-                    self.expression(node.call, "REG")
+                # chamada como comando usa EFFECT (resultado descartado, dst=None), seja void ou não
+                self.expression(node.call, EFFECT)
 
             case _:
                 raise NotImplementedError(f"Comando não implementado: {type(node).__name__}")
